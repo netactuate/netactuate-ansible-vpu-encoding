@@ -1,0 +1,521 @@
+---
+# NetActuate NETINT Quadra VPU — Provision, Install, Test, and Compare
+#
+# Provisions a NetActuate VM with a NETINT Quadra T1U VPU attached,
+# installs the NETINT software stack (libxcoder + ffmpeg), runs
+# hardware-accelerated encoding tests, and compares VPU vs CPU performance.
+#
+# Prerequisites:
+#   export NETACTUATE_API_KEY="your-api-key"
+#
+# Full build (compiles NETINT stack from source, ~10 min):
+#   ansible-playbook netint-vpu-deploy.yml
+#
+# Fast deploy from golden image (boots ready to encode, ~30 sec):
+#   ansible-playbook netint-vpu-deploy.yml -e vpu_image_id=IMAGE_ID -e skip_build=true
+#
+# Build the golden image first:
+#   ansible-playbook netint-vpu-build-image.yml
+#
+# With a custom test file:
+#   ansible-playbook netint-vpu-deploy.yml -e test_input_url=https://example.com/video.mp4
+#
+# Override defaults:
+#   ansible-playbook netint-vpu-deploy.yml \
+#     -e vpu_plan=VR8x8x200 \
+#     -e vpu_hostname=encoder-01.example.com \
+#     -e vpu_ssh_key_id=YOUR_KEY_ID
+
+# ────────────────────────────────────────────────────────────
+# Play 1: Provision VM with VPU
+# ────────────────────────────────────────────────────────────
+- name: Provision NetActuate VM with NETINT Quadra VPU
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    vpu_hostname: "vpu-encoder.example.com"
+    vpu_plan: "VR8x4x100"
+    vpu_location_id: 281
+    # Default image: Ubuntu 24.04 base (5787). When a global NETINT pre-built
+    # image is available, update this default to skip the build step entirely.
+    # Users can also set this to their own golden image ID.
+    vpu_image_id: 5787
+    vpu_ssh_key_id: ""  # Set via -e or environment
+    vpu_accelerator_type_id: 1
+    vpu_firmware_id: 1
+    vpu_attachment_type: "vf"
+    vpu_contract_id: ""  # Set via -e or environment
+    na_api_key: "{{ lookup('env', 'NETACTUATE_API_KEY') }}"
+
+  tasks:
+    - name: Create server with Quadra T1U VPU attached
+      ansible.builtin.uri:
+        url: "https://vapi2.netactuate.com/api/cloud/server/buy_build?key={{ na_api_key }}"
+        method: POST
+        body_format: json
+        body:
+          plan: "{{ vpu_plan }}"
+          location: "{{ vpu_location_id }}"
+          image: "{{ vpu_image_id }}"
+          fqdn: "{{ vpu_hostname }}"
+          ssh_key_id: "{{ vpu_ssh_key_id }}"
+          package_billing: "usage"
+          package_billing_contract_id: "{{ vpu_contract_id }}"
+          has_accelerator: true
+          accelerators:
+            - type_id: "{{ vpu_accelerator_type_id }}"
+              attachment_type: "{{ vpu_attachment_type }}"
+              firmware_id: "{{ vpu_firmware_id }}"
+        status_code: 200
+      register: build_response
+
+    - name: Store server ID
+      ansible.builtin.set_fact:
+        vpu_server_id: "{{ build_response.json.data.mbpkgid }}"
+
+    - name: Wait for server to finish building
+      ansible.builtin.uri:
+        url: "https://vapi2.netactuate.com/api/cloud/server/{{ vpu_server_id }}?key={{ na_api_key }}"
+        method: GET
+        return_content: true
+      register: server_status
+      until: >
+        server_status.json is defined and
+        server_status.json.data is defined and
+        server_status.json.data.status is defined and
+        server_status.json.data.status == "RUNNING"
+      retries: 30
+      delay: 10
+
+    - name: Display provisioned server info
+      ansible.builtin.debug:
+        msg: >-
+          Server provisioned — ID: {{ vpu_server_id }},
+          IP: {{ server_status.json.data.ip }},
+          Accelerators: {{ server_status.json.data.accelerators | length }} attached
+
+    - name: Wait for SSH to become reachable
+      ansible.builtin.wait_for:
+        host: "{{ server_status.json.data.ip }}"
+        port: 22
+        delay: 30
+        timeout: 300
+        search_regex: OpenSSH
+        state: started
+
+    - name: Add provisioned VM to vpu_nodes group
+      ansible.builtin.add_host:
+        name: "{{ server_status.json.data.ip }}"
+        groups: vpu_nodes
+        ansible_host: "{{ server_status.json.data.ip }}"
+        ansible_user: "{{ vpu_ssh_user | default('ubuntu') }}"
+        ansible_ssh_private_key_file: "{{ vpu_ssh_key_file | default('~/.ssh/id_rsa') }}"
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no"
+
+# ────────────────────────────────────────────────────────────
+# Play 2: Install NETINT stack, run CPU vs VPU comparison
+# ────────────────────────────────────────────────────────────
+- name: Configure NETINT VPU and run CPU vs VPU encoding comparison
+  hosts: vpu_nodes
+  become: true
+  gather_facts: true
+
+  vars:
+    work_dir: /opt/netint
+    test_dir: /opt/netint/test
+    # Set to skip NETINT stack build (use with golden image)
+    skip_build: false
+    # Default test video: Big Buck Bunny 1080p 10s (30MB, real-world content)
+    # Set to empty string to generate a synthetic test pattern instead
+    # Set to your own URL for custom content
+    test_input_url: "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_30MB.mp4"
+    # Test video duration in seconds (only used when generating synthetic input)
+    test_duration: 10
+    # Encoding bitrate targets
+    h264_bitrate: "5M"
+    h265_bitrate: "3M"
+    av1_bitrate: "2M"
+
+  tasks:
+    # ── Prerequisites (skipped when using golden image) ─────
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      when: not skip_build | bool
+
+    - name: Install build prerequisites
+      ansible.builtin.apt:
+        name:
+          - pkg-config
+          - git
+          - gcc
+          - make
+          - g++
+          - yasm
+          - nasm
+          - nvme-cli
+          - curl
+          - bc
+          - libx264-dev
+          - libx265-dev
+          - unzip
+          - sysfsutils
+          - ca-certificates
+          - gnupg
+        state: present
+      when: not skip_build | bool
+
+    - name: Install runtime dependencies (golden image mode)
+      ansible.builtin.apt:
+        update_cache: true
+        name: [bc, curl, unzip, sysfsutils, ca-certificates, gnupg]
+        state: present
+      when: skip_build | bool
+
+    - name: Add Docker GPG key
+      ansible.builtin.shell:
+        cmd: |
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+        creates: /etc/apt/keyrings/docker.asc
+
+    - name: Add Docker repository
+      ansible.builtin.shell:
+        cmd: |
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+          apt-get update
+        creates: /etc/apt/sources.list.d/docker.list
+
+    - name: Install Docker Engine with Compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+
+    - name: Create working directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ work_dir }}"
+        - "{{ test_dir }}"
+
+    # ── Build libxcoder (skipped with golden image) ────────
+    - name: Clone and build libxcoder
+      ansible.builtin.shell:
+        cmd: |
+          cd {{ work_dir }}
+          git clone https://github.com/NETINT-Technologies/netint_libxcoder
+          cd netint_libxcoder && bash build.sh
+          ldconfig
+        creates: "{{ work_dir }}/netint_libxcoder/build"
+      when: not skip_build | bool
+
+    # ── Build netint_ffmpeg with libx264/libx265 support (skipped with golden image) ──
+    - name: Clone and build netint_ffmpeg
+      ansible.builtin.shell:
+        cmd: |
+          cd {{ work_dir }}
+          git clone https://github.com/NETINT-Technologies/netint_ffmpeg
+          cd netint_ffmpeg
+          ./configure --enable-ni_quadra --enable-libx264 --enable-libx265 --enable-gpl
+          make -j$(nproc)
+          make install
+          ldconfig
+        creates: /usr/local/bin/ffmpeg
+      when: not skip_build | bool
+
+    # ── Initialize VPU (always runs — needed after every boot) ──
+    - name: Initialize VPU cards
+      ansible.builtin.command:
+        cmd: init_rsrc
+
+    - name: Create netint-init systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/netint-init.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Initialize NETINT Quadra VPU resources
+          After=network.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/init_rsrc
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable netint-init service
+      ansible.builtin.systemd:
+        name: netint-init
+        enabled: true
+        daemon_reload: true
+
+    # ── Install Bitstreams ──────────────────────────────────
+    - name: Check if Bitstreams is already installed
+      ansible.builtin.shell:
+        cmd: docker ps --format '{% raw %}{{.Names}}{% endraw %}' 2>/dev/null | grep -q bitstreams
+      register: bitstreams_check
+      changed_when: false
+      failed_when: false
+
+    - name: Ensure Docker is running before Bitstreams install
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Download and install Bitstreams
+      ansible.builtin.shell:
+        cmd: |
+          mkdir -p /opt/bitstreams
+          cd /opt/bitstreams
+          wget -q {{ bitstreams_url | default('https://releases.netint.com/edge/4G6C3K1I7SI6N5R/Bitstreams_Edge_v2.11.0_x86.zip') }} -O bitstreams.zip
+          unzip -o bitstreams.zip
+          # Handle varying zip structures (edge/ subdir or flat Bitstreams_Edge_*)
+          if [ -d edge ]; then mv edge/* . && rmdir edge; fi
+          for d in Bitstreams_Edge_*; do [ -d "$d" ] && mv "$d"/* . && rmdir "$d"; done
+          # Remove missing files from checksum to prevent install failure
+          python3 -c "
+          import json, os
+          with open('checksum.json') as f: d = json.load(f)
+          d = {k:v for k,v in d.items() if os.path.exists(k)}
+          with open('checksum.json','w') as f: json.dump(d, f)
+          "
+          python3 ./edge_quick_install.py $(hostname -I | awk '{print $1}') http -y --keep-release-directory
+          rm -f bitstreams.zip
+        creates: /opt/bitstreams/release/configs/docker-compose.yml
+      when: bitstreams_check.rc != 0
+
+    - name: Create Bitstreams API token for automation
+      ansible.builtin.shell:
+        cmd: |
+          TOKEN_ID="{{ bitstreams_token_id | default('netactuate-api') }}"
+          TOKEN_SECRET="{{ bitstreams_token_secret | default('netactuate-automation') }}"
+          TOKEN_MD5=$(echo -n "$TOKEN_SECRET" | md5sum | awk '{print $1}')
+          docker exec configs-mysql-1 mysql -u root -p"$BITSTREAMS_DB_PWD" ni_user -e "
+            INSERT IGNORE INTO livetran_user_token (userid, user_name_id, name, description, token_id, token_secret_md5, environment_id, permissions, status, expires_at, create_time, update_time)
+            SELECT u.userid, un.id, 'automation', 'Auto-generated API token', '$TOKEN_ID', '$TOKEN_MD5', 0, '0', 1, 0, NOW(), NOW()
+            FROM livetran_user u JOIN livetran_user_name un ON u.userid = un.userid LIMIT 1;
+          "
+      register: token_result
+      changed_when: "'Query OK, 1 row' in token_result.stdout"
+      failed_when: false
+
+    # ── Verify encoder availability ────────────────────────
+    - name: Check for ni_quadra encoders in NETINT ffmpeg
+      ansible.builtin.shell:
+        cmd: /usr/local/bin/ffmpeg -encoders 2>/dev/null | grep ni_quadra
+      register: encoder_check
+      failed_when: encoder_check.rc != 0
+      changed_when: false
+
+    - name: Display available Quadra encoders
+      ansible.builtin.debug:
+        msg: "{{ encoder_check.stdout_lines }}"
+
+    # ── Prepare test input ─────────────────────────────────
+    - name: Check if test input already exists
+      ansible.builtin.stat:
+        path: "{{ test_dir }}/input.mp4"
+      register: test_input
+
+    - name: Download user-provided test video
+      ansible.builtin.get_url:
+        url: "{{ test_input_url }}"
+        dest: "{{ test_dir }}/input.mp4"
+        mode: "0644"
+      when: test_input_url | length > 0 and not test_input.stat.exists
+
+    - name: Generate 1080p test video
+      ansible.builtin.command:
+        cmd: >-
+          /usr/local/bin/ffmpeg -y
+          -f lavfi -i testsrc2=size=1920x1080:rate=30:duration={{ test_duration }}
+          -pix_fmt yuv420p
+          -c:v libx264 -preset ultrafast
+          {{ test_dir }}/input.mp4
+      when: test_input_url | length == 0 and not test_input.stat.exists
+
+    # ── Check for interlaced input ───────────────────────────
+    - name: Detect interlaced content in test input
+      ansible.builtin.shell:
+        cmd: >-
+          /usr/local/bin/ffprobe -v error -select_streams v:0
+          -show_entries stream=field_order
+          -of default=noprint_wrappers=1:nokey=1
+          {{ test_dir }}/input.mp4
+      register: field_order
+      changed_when: false
+
+    - name: Deinterlace input if interlaced
+      ansible.builtin.shell:
+        cmd: >-
+          /usr/local/bin/ffmpeg -y
+          -i {{ test_dir }}/input.mp4
+          -vf yadif -c:v libx264 -preset ultrafast
+          {{ test_dir }}/input_progressive.mp4
+          && mv {{ test_dir }}/input_progressive.mp4 {{ test_dir }}/input.mp4
+      when: field_order.stdout in ['tt', 'bb', 'tb', 'bt']
+
+    - name: Warn if input was interlaced
+      ansible.builtin.debug:
+        msg: >-
+          Input video was interlaced (field_order={{ field_order.stdout }}).
+          It has been deinterlaced automatically. The Quadra VPU does not
+          support interlaced content for encoding or decoding.
+      when: field_order.stdout in ['tt', 'bb', 'tb', 'bt']
+
+    # ── CPU baseline encoding ──────────────────────────────
+    # NETINT ffmpeg is compiled with --enable-libx264 --enable-libx265 so a
+    # single binary handles both CPU and VPU encoding.
+
+    - name: "CPU encode: H.264 (libx264)"
+      ansible.builtin.shell:
+        cmd: >-
+          /usr/bin/time -f '%e' /usr/local/bin/ffmpeg -y
+          -i {{ test_dir }}/input.mp4
+          -c:v libx264 -b:v {{ h264_bitrate }} -preset medium
+          {{ test_dir }}/cpu_h264.mp4
+          2>&1 | tail -1
+      register: cpu_h264
+      ignore_errors: true
+
+    - name: "CPU encode: H.265 (libx265)"
+      ansible.builtin.shell:
+        cmd: >-
+          /usr/bin/time -f '%e' /usr/local/bin/ffmpeg -y
+          -i {{ test_dir }}/input.mp4
+          -c:v libx265 -b:v {{ h265_bitrate }} -preset medium
+          {{ test_dir }}/cpu_hevc.mp4
+          2>&1 | tail -1
+      register: cpu_h265
+      ignore_errors: true
+
+    - name: "CPU encode: AV1 (libaom-av1)"
+      ansible.builtin.shell:
+        cmd: >-
+          /usr/bin/time -f '%e' /usr/local/bin/ffmpeg -y
+          -i {{ test_dir }}/input.mp4
+          -c:v libaom-av1 -b:v {{ av1_bitrate }} -cpu-used 6 -row-mt 1
+          {{ test_dir }}/cpu_av1.mp4
+          2>&1 | tail -1
+      register: cpu_av1
+      ignore_errors: true
+
+    # ── VPU hardware encoding ──────────────────────────────
+    - name: "VPU encode: H.264 (h264_ni_quadra_enc)"
+      ansible.builtin.shell:
+        cmd: >-
+          /usr/bin/time -f '%e' /usr/local/bin/ffmpeg -y
+          -i {{ test_dir }}/input.mp4
+          -c:v h264_ni_quadra_enc -b:v {{ h264_bitrate }}
+          {{ test_dir }}/vpu_h264.mp4
+          2>&1 | tail -1
+      register: vpu_h264
+      ignore_errors: true
+
+    - name: "VPU encode: H.265 (h265_ni_quadra_enc)"
+      ansible.builtin.shell:
+        cmd: >-
+          /usr/bin/time -f '%e' /usr/local/bin/ffmpeg -y
+          -i {{ test_dir }}/input.mp4
+          -c:v h265_ni_quadra_enc -b:v {{ h265_bitrate }}
+          {{ test_dir }}/vpu_hevc.mp4
+          2>&1 | tail -1
+      register: vpu_h265
+      ignore_errors: true
+
+    - name: "VPU encode: AV1 (av1_ni_quadra_enc)"
+      ansible.builtin.shell:
+        cmd: >-
+          /usr/bin/time -f '%e' /usr/local/bin/ffmpeg -y
+          -i {{ test_dir }}/input.mp4
+          -c:v av1_ni_quadra_enc -b:v {{ av1_bitrate }}
+          {{ test_dir }}/vpu_av1.mp4
+          2>&1 | tail -1
+      register: vpu_av1
+      ignore_errors: true
+
+    # ── Full VPU transcode (decode + encode on card) ───────
+    - name: "VPU transcode: H.264 decode → H.265 encode (full hardware pipeline)"
+      ansible.builtin.shell:
+        cmd: >-
+          /usr/bin/time -f '%e' /usr/local/bin/ffmpeg -y
+          -c:v h264_ni_quadra_dec -i {{ test_dir }}/input.mp4
+          -c:v h265_ni_quadra_enc -b:v {{ h265_bitrate }}
+          {{ test_dir }}/vpu_transcode_hevc.mp4
+          2>&1 | tail -1
+      register: vpu_transcode
+      ignore_errors: true
+
+    # ── Collect file sizes ─────────────────────────────────
+    - name: Get all output file sizes
+      ansible.builtin.stat:
+        path: "{{ test_dir }}/{{ item }}"
+      register: all_outputs
+      loop:
+        - cpu_h264.mp4
+        - cpu_hevc.mp4
+        - cpu_av1.mp4
+        - vpu_h264.mp4
+        - vpu_hevc.mp4
+        - vpu_av1.mp4
+        - vpu_transcode_hevc.mp4
+
+    # ── Display comparison results ─────────────────────────
+    - name: Display CPU vs VPU encoding comparison
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════════╗
+          ║              CPU vs VPU Encoding Comparison                      ║
+          ╠════════════════════════════════════════════════════════════════════╣
+          ║                                                                  ║
+          ║  H.264                                                           ║
+          ║    CPU (libx264):            {{ '%6s sec' | format(cpu_h264.stdout | default('N/A')) }}   {{ '%.2f MB' | format(all_outputs.results[0].stat.size / 1048576) if all_outputs.results[0].stat.exists else 'no output' }}     ║
+          ║    VPU (h264_ni_quadra_enc): {{ '%6s sec' | format(vpu_h264.stdout | default('N/A')) }}   {{ '%.2f MB' | format(all_outputs.results[3].stat.size / 1048576) if all_outputs.results[3].stat.exists else 'no output' }}     ║
+          ║                                                                  ║
+          ║  H.265                                                           ║
+          ║    CPU (libx265):            {{ '%6s sec' | format(cpu_h265.stdout | default('N/A')) }}   {{ '%.2f MB' | format(all_outputs.results[1].stat.size / 1048576) if all_outputs.results[1].stat.exists else 'no output' }}     ║
+          ║    VPU (h265_ni_quadra_enc): {{ '%6s sec' | format(vpu_h265.stdout | default('N/A')) }}   {{ '%.2f MB' | format(all_outputs.results[4].stat.size / 1048576) if all_outputs.results[4].stat.exists else 'no output' }}     ║
+          ║                                                                  ║
+          ║  AV1                                                             ║
+          ║    CPU (libaom-av1):         {{ '%6s sec' | format(cpu_av1.stdout | default('N/A')) }}   {{ '%.2f MB' | format(all_outputs.results[2].stat.size / 1048576) if all_outputs.results[2].stat.exists else 'no output' }}     ║
+          ║    VPU (av1_ni_quadra_enc):  {{ '%6s sec' | format(vpu_av1.stdout | default('N/A')) }}   {{ '%.2f MB' | format(all_outputs.results[5].stat.size / 1048576) if all_outputs.results[5].stat.exists else 'no output' }}     ║
+          ║                                                                  ║
+          ║  Full VPU Transcode (H.264 decode → H.265 encode)               ║
+          ║    VPU pipeline:             {{ '%6s sec' | format(vpu_transcode.stdout | default('N/A')) }}   {{ '%.2f MB' | format(all_outputs.results[6].stat.size / 1048576) if all_outputs.results[6].stat.exists else 'no output' }}     ║
+          ║                                                                  ║
+          ╚════════════════════════════════════════════════════════════════════╝
+
+    # ── VPU monitoring ─────────────────────────────────────
+    - name: Capture VPU utilization and temperature
+      ansible.builtin.command:
+        cmd: ni_rsrc_mon
+      register: vpu_monitor
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display VPU status
+      ansible.builtin.debug:
+        msg: "{{ vpu_monitor.stdout_lines }}"
+      when: vpu_monitor.rc == 0
+
+    - name: Fail if any VPU encoding test failed
+      ansible.builtin.fail:
+        msg: >-
+          One or more VPU encoding tests failed:
+          H.264={{ vpu_h264.rc }},
+          H.265={{ vpu_h265.rc }},
+          AV1={{ vpu_av1.rc }}
+      when: vpu_h264.rc != 0 or vpu_h265.rc != 0 or vpu_av1.rc != 0

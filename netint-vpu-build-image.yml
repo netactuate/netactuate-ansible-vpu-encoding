@@ -1,0 +1,319 @@
+---
+# NetActuate NETINT Quadra VPU — Build Golden Image
+#
+# Provisions a VM with a VPU, installs the full NETINT software stack,
+# verifies it works, then creates a custom image (snapshot) for fast
+# future deployments. VMs deployed from this image boot ready to encode
+# with no compile step needed.
+#
+# Usage:
+#   export NETACTUATE_API_KEY="your-api-key"
+#   ansible-playbook netint-vpu-build-image.yml
+#
+# After this completes, note the image_id in the output. Use it with
+# netint-vpu-deploy.yml -e vpu_image_id=<image_id> for instant deploys.
+
+# ────────────────────────────────────────────────────────────
+# Play 1: Provision VM with VPU
+# ────────────────────────────────────────────────────────────
+- name: Provision VM for golden image build
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    vpu_hostname: "vpu-golden.example.com"
+    vpu_plan: "VR8x4x100"
+    vpu_location_id: 281
+    vpu_image_id: 5787
+    vpu_ssh_key_id: ""  # Set via -e or environment
+    vpu_accelerator_type_id: 1
+    vpu_firmware_id: 1
+    vpu_attachment_type: "vf"
+    vpu_contract_id: ""  # Set via -e or environment
+    na_api_key: "{{ lookup('env', 'NETACTUATE_API_KEY') }}"
+
+  tasks:
+    - name: Create server with Quadra T1U VPU attached
+      ansible.builtin.uri:
+        url: "https://vapi2.netactuate.com/api/cloud/server/buy_build?key={{ na_api_key }}"
+        method: POST
+        body_format: json
+        body:
+          plan: "{{ vpu_plan }}"
+          location: "{{ vpu_location_id }}"
+          image: "{{ vpu_image_id }}"
+          fqdn: "{{ vpu_hostname }}"
+          ssh_key_id: "{{ vpu_ssh_key_id }}"
+          package_billing: "usage"
+          package_billing_contract_id: "{{ vpu_contract_id }}"
+          has_accelerator: true
+          accelerators:
+            - type_id: "{{ vpu_accelerator_type_id }}"
+              attachment_type: "{{ vpu_attachment_type }}"
+              firmware_id: "{{ vpu_firmware_id }}"
+        status_code: 200
+      register: build_response
+
+    - name: Store server ID
+      ansible.builtin.set_fact:
+        vpu_server_id: "{{ build_response.json.data.mbpkgid }}"
+
+    - name: Wait for server to finish building
+      ansible.builtin.uri:
+        url: "https://vapi2.netactuate.com/api/cloud/server/{{ vpu_server_id }}?key={{ na_api_key }}"
+        method: GET
+      register: server_status
+      until: server_status.json.data.status == "RUNNING"
+      retries: 30
+      delay: 10
+
+    - name: Wait for SSH
+      ansible.builtin.wait_for:
+        host: "{{ server_status.json.data.ip }}"
+        port: 22
+        delay: 30
+        timeout: 300
+        search_regex: OpenSSH
+
+    - name: Add to build group
+      ansible.builtin.add_host:
+        name: "{{ server_status.json.data.ip }}"
+        groups: build_host
+        ansible_host: "{{ server_status.json.data.ip }}"
+        ansible_user: ubuntu
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no"
+        server_id: "{{ vpu_server_id }}"
+
+# ────────────────────────────────────────────────────────────
+# Play 2: Install NETINT stack
+# ────────────────────────────────────────────────────────────
+- name: Install NETINT software stack
+  hosts: build_host
+  become: true
+  gather_facts: true
+
+  vars:
+    work_dir: /opt/netint
+
+  tasks:
+    - name: Update apt and install prerequisites
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - pkg-config
+          - git
+          - gcc
+          - make
+          - g++
+          - yasm
+          - nasm
+          - nvme-cli
+          - curl
+          - bc
+          - libx264-dev
+          - libx265-dev
+          - unzip
+          - sysfsutils
+          - ca-certificates
+          - gnupg
+        state: present
+
+    - name: Add Docker GPG key
+      ansible.builtin.shell:
+        cmd: |
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+        creates: /etc/apt/keyrings/docker.asc
+
+    - name: Add Docker repository
+      ansible.builtin.shell:
+        cmd: |
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+          apt-get update
+        creates: /etc/apt/sources.list.d/docker.list
+
+    - name: Install Docker Engine with Compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+
+    - name: Create work directory
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Clone and build libxcoder
+      ansible.builtin.shell:
+        cmd: |
+          cd {{ work_dir }}
+          git clone https://github.com/NETINT-Technologies/netint_libxcoder
+          cd netint_libxcoder && bash build.sh
+          ldconfig
+        creates: "{{ work_dir }}/netint_libxcoder/build"
+
+    - name: Clone and build netint_ffmpeg with libx264/libx265 support
+      ansible.builtin.shell:
+        cmd: |
+          cd {{ work_dir }}
+          git clone https://github.com/NETINT-Technologies/netint_ffmpeg
+          cd netint_ffmpeg
+          ./configure --enable-ni_quadra --enable-libx264 --enable-libx265 --enable-gpl
+          make -j$(nproc)
+          make install
+          ldconfig
+        creates: /usr/local/bin/ffmpeg
+
+    - name: Initialize VPU
+      ansible.builtin.command:
+        cmd: init_rsrc
+
+    - name: Create netint-init systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/netint-init.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Initialize NETINT Quadra VPU resources
+          After=network.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/init_rsrc
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable netint-init service
+      ansible.builtin.systemd:
+        name: netint-init
+        enabled: true
+        daemon_reload: true
+
+    - name: Verify encoders
+      ansible.builtin.shell:
+        cmd: /usr/local/bin/ffmpeg -encoders 2>/dev/null | grep ni_quadra
+      register: encoder_check
+      failed_when: encoder_check.rc != 0
+      changed_when: false
+
+    - name: Display available encoders
+      ansible.builtin.debug:
+        msg: "{{ encoder_check.stdout_lines }}"
+
+    - name: Download and install Bitstreams
+      ansible.builtin.shell:
+        cmd: |
+          mkdir -p /opt/bitstreams
+          cd /opt/bitstreams
+          wget -q {{ bitstreams_url | default('https://releases.netint.com/edge/4G6C3K1I7SI6N5R/Bitstreams_Edge_v2.11.0_x86.zip') }} -O bitstreams.zip
+          unzip -o bitstreams.zip
+          if [ -d edge ]; then mv edge/* . && rmdir edge; fi
+          for d in Bitstreams_Edge_*; do [ -d "$d" ] && mv "$d"/* . && rmdir "$d"; done
+          python3 -c "
+          import json, os
+          with open('checksum.json') as f: d = json.load(f)
+          d = {k:v for k,v in d.items() if os.path.exists(k)}
+          with open('checksum.json','w') as f: json.dump(d, f)
+          "
+          python3 ./edge_quick_install.py $(hostname -I | awk '{print $1}') http -y --keep-release-directory
+          rm -f bitstreams.zip
+        creates: /opt/bitstreams/release/configs/docker-compose.yml
+
+    - name: Clean apt cache to reduce image size
+      ansible.builtin.apt:
+        autoclean: true
+
+    - name: Clean build artifacts to reduce image size
+      ansible.builtin.shell:
+        cmd: |
+          rm -rf {{ work_dir }}/netint_libxcoder/.git
+          rm -rf {{ work_dir }}/netint_ffmpeg/.git
+          rm -rf {{ work_dir }}/netint_ffmpeg/libavcodec/*.o
+          rm -rf {{ work_dir }}/netint_ffmpeg/libavformat/*.o
+      changed_when: false
+
+# ────────────────────────────────────────────────────────────
+# Play 3: Create custom image from the built VM
+# ────────────────────────────────────────────────────────────
+- name: Create golden image snapshot
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    na_api_key: "{{ lookup('env', 'NETACTUATE_API_KEY') }}"
+    image_name: "Ubuntu 24.04 + NETINT Quadra VPU Stack + Bitstreams"
+
+  tasks:
+    - name: Get server ID from build host
+      ansible.builtin.set_fact:
+        server_id: "{{ hostvars[groups['build_host'][0]]['server_id'] }}"
+
+    - name: Create custom image from server
+      ansible.builtin.uri:
+        url: "https://vapi2.netactuate.com/api/cloud/images/create?key={{ na_api_key }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          id: "{{ server_id }}"
+          name: "{{ image_name }}"
+        status_code: 200
+      register: image_response
+
+    - name: Display image creation result
+      ansible.builtin.debug:
+        msg: >-
+          Image creation started!
+          Server ID: {{ server_id }}
+          Image Name: {{ image_name }}
+          Response: {{ image_response.json }}
+
+    # IMPORTANT: The source VM must stay running through the entire image pipeline.
+    # The pipeline stages are: image_create → copy_prepare → image_copy → library_image_process.
+    # Deleting the VM before library_image_process completes causes a silent failure.
+
+    - name: Wait for image to be ready (polling os_enabled flag)
+      ansible.builtin.uri:
+        url: "https://vapi2.netactuate.com/api/cloud/images/my?key={{ na_api_key }}"
+        method: GET
+      register: image_poll
+      until: >
+        image_poll.json.data | selectattr('os', 'equalto', image_name) |
+        selectattr('os_enabled', 'equalto', 1) | list | length > 0
+      retries: 60
+      delay: 30
+
+    - name: Find the golden image ID
+      ansible.builtin.set_fact:
+        golden_image: "{{ image_poll.json.data | selectattr('os', 'equalto', image_name) | selectattr('os_enabled', 'equalto', 1) | list | first }}"
+
+    - name: Display golden image info
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════╗
+          ║  Golden Image Created                                   ║
+          ╠══════════════════════════════════════════════════════════╣
+          ║  Image ID: {{ golden_image.id }}
+          ║  Name: {{ golden_image.os }}
+          ║                                                         ║
+          ║  Use with fast deploy:                                  ║
+          ║  ansible-playbook netint-vpu-deploy.yml \               ║
+          ║    -e vpu_image_id={{ golden_image.id }} -e skip_build=true              ║
+          ╚══════════════════════════════════════════════════════════╝
+
+    - name: Delete the build VM (image is saved independently)
+      ansible.builtin.uri:
+        url: "https://vapi2.netactuate.com/api/cloud/server/delete?mbpkgid={{ server_id }}&cancel_billing=1&key={{ na_api_key }}"
+        method: POST
+
+    - name: Confirm VM deleted
+      ansible.builtin.debug:
+        msg: "Build VM {{ server_id }} deleted. Golden image {{ golden_image.id }} preserved."
